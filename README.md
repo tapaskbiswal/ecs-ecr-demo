@@ -102,12 +102,111 @@ Lists the images. You should see the `latest` tag.
 
 In the console: AWS Console > ECR > Private registry > Repositories > `tapasawsbatch18` > **Images** tab. Make sure the region is N. California and refresh.
 
-## 6. Cleanup (optional)
+## 6. Deploy the image to ECS (Fargate)
+
+ECS concepts:
+- Task definition: versioned config describing how containers run.
+- Container definition: config of one container inside a task definition.
+- Task: a running instance of a task definition.
+- Service: keeps the desired number of tasks running and manages updates.
+- Capacity provider: the compute capacity (Fargate or EC2).
+- Repository: ECR, where the image is stored.
+
+Files used (already in this folder): `taskdef.json` (task definition template with an `ACCOUNT_ID` placeholder) and `trust.json` (lets ECS tasks assume a role).
+
+### 6.1 Create the task execution role (one time)
+```powershell
+aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file://trust.json
+```
+Creates the role ECS uses to pull the image from ECR and write logs. If it already exists, you get an error you can ignore.
+
+```powershell
+aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+```
+Gives the role the AWS-managed permissions for ECR pulls and CloudWatch logs.
+
+### 6.2 Create the cluster and log group
+```powershell
+aws ecs create-cluster --cluster-name tapas-cluster --region us-west-1
+```
+Creates the ECS cluster, the logical group your tasks run in.
+
+```powershell
+aws logs create-log-group --log-group-name /ecs/tapasawsbatch18 --region us-west-1
+```
+Creates the CloudWatch log group where container logs go.
+
+### 6.3 Register the task definition
+```powershell
+$acc = aws sts get-caller-identity --query Account --output text
+(Get-Content taskdef.json) -replace 'ACCOUNT_ID', $acc | Set-Content taskdef.rendered.json
+```
+Copies the template and fills in your account ID. The rendered file is git-ignored, so your account ID is not committed.
+
+```powershell
+aws ecs register-task-definition --cli-input-json file://taskdef.rendered.json --region us-west-1
+```
+Registers a new revision of the task definition (image, CPU, memory, port, logs).
+
+### 6.4 Prepare networking (default VPC)
+```powershell
+$vpc = aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text --region us-west-1
+$subnets = (aws ec2 describe-subnets --filters Name=vpc-id,Values=$vpc --query "Subnets[*].SubnetId" --output text --region us-west-1) -split "\s+" -join ","
+```
+Finds the default VPC and its subnets (joined with commas).
+
+```powershell
+$sg = aws ec2 create-security-group --group-name tapas-ecs-sg --description "ECS app" --vpc-id $vpc --query GroupId --output text --region us-west-1
+aws ec2 authorize-security-group-ingress --group-id $sg --protocol tcp --port 3000 --cidr 0.0.0.0/0 --region us-west-1
+```
+Creates a security group and opens port 3000 so you can reach the app. For anything beyond a demo, restrict the CIDR to your own IP.
+
+### 6.5 Create the service
+```powershell
+aws ecs create-service --cluster tapas-cluster --service-name tapas-service --task-definition tapasawsbatch18 --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$sg],assignPublicIp=ENABLED}" --region us-west-1
+```
+Starts 1 Fargate task and keeps it running. `assignPublicIp=ENABLED` gives it a public IP, which it also needs to pull from ECR in a default VPC.
+
+### 6.6 Check status and test
+```powershell
+aws ecs describe-services --cluster tapas-cluster --services tapas-service --query "services[0].{status:status,running:runningCount,desired:desiredCount}" --region us-west-1
+```
+Wait until `running` is 1.
+
+```powershell
+$task = aws ecs list-tasks --cluster tapas-cluster --service-name tapas-service --query "taskArns[0]" --output text --region us-west-1
+$eni = aws ecs describe-tasks --cluster tapas-cluster --tasks $task --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text --region us-west-1
+$ip = aws ec2 describe-network-interfaces --network-interface-ids $eni --query "NetworkInterfaces[0].Association.PublicIp" --output text --region us-west-1
+curl "http://${ip}:3000"
+curl "http://${ip}:3000/students"
+```
+Looks up the task's public IP and calls the app. You should get JSON back.
+
+Console: ECS > Clusters > `tapas-cluster` > Services > `tapas-service` > Tasks. Check the region is N. California.
+
+### 6.7 Deploy a new version
+```powershell
+docker build -t tapasawsbatch18 .
+docker tag tapasawsbatch18:latest "$acc.dkr.ecr.us-west-1.amazonaws.com/tapasawsbatch18:latest"
+docker push "$acc.dkr.ecr.us-west-1.amazonaws.com/tapasawsbatch18:latest"
+aws ecs update-service --cluster tapas-cluster --service tapas-service --force-new-deployment --region us-west-1
+```
+Rebuilds and pushes the image, then makes the service start new tasks that pull it. The public IP changes after a deployment.
+
+## 7. Cleanup (optional)
+
+Delete ECS resources first to stop charges:
+```powershell
+aws ecs update-service --cluster tapas-cluster --service tapas-service --desired-count 0 --region us-west-1
+aws ecs delete-service --cluster tapas-cluster --service tapas-service --force --region us-west-1
+aws ecs delete-cluster --cluster tapas-cluster --region us-west-1
+```
+Scales the service to zero, deletes it, then deletes the cluster.
 
 ```powershell
 aws ecr delete-repository --repository-name tapasawsbatch18 --region us-west-1 --force
 ```
-Deletes the repository and all its images.
+Deletes the ECR repository and all its images.
 
 ## Issues I Faced and Fixes
 
@@ -119,6 +218,8 @@ Deletes the repository and all its images.
 | 4 | `docker login` username | I wasn't sure what to enter | The username is always the fixed text `AWS`. The password is generated by `aws ecr get-login-password`, so I never type it. |
 | 5 | Timestamps in the console differ from my clock | The console shows UTC+05:30 local time | Not a problem. It is only a display difference. |
 | 6 | `list-images` showed extra untagged digests | Multi-platform builds create extra manifests | Normal. Only the `latest` tag matters. |
+| 7 | ECS task stops with `CannotPullContainerError` | No public IP or missing execution role | Use `assignPublicIp=ENABLED` and the `ecsTaskExecutionRole` from 6.1. |
+| 8 | App not reachable on the task IP | Security group doesn't allow port 3000 | Add the inbound rule from 6.4. |
 
 ## Security Notes (safe for GitHub)
 

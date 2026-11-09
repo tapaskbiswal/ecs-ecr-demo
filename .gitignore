@@ -3,3 +3,4 @@ node_modules
 .aws
 *.pem
 *.key
+taskdef.rendered.json
